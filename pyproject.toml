@@ -81,9 +81,6 @@ from-first = true
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "pickle".msg = "Use a data-only serialization format instead."
-# The RBLN connector sits on torch-rbln; the RBLN runtime (``rebel``) is
-# reached only by the RDS storage plugin in lmcache-rbln.
-"rebel".msg = "Go through torch-rbln; lmcache.inprocess.rbln must not import rebel."
 
 [tool.mypy]
 platform = "linux"

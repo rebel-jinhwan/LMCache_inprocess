@@ -76,9 +76,6 @@ and tests compatibility against a pinned LMCache revision and current LMCache
 ## Repository layout
 
 - `lmcache/inprocess/`: package source
-- `lmcache/inprocess/rbln/`: RBLN NPU connector for vLLM-RBLN (needs
-  `torch-rbln` and `vllm-rbln` from the RBLN SDK; see
-  `docs/source/legacy/getting_started/quickstart/rbln_npu.rst`)
 - `lmcache/integration/`: compatibility shims for inference-engine import paths
 - `tests/inprocess/`: copied unit and integration tests
 - `examples/inprocess/`: in-process examples
