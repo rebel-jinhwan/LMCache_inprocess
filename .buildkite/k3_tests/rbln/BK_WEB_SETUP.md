@@ -26,10 +26,14 @@ verified record can be read, the upload step fails. Set `PINNED_RBLN_IMAGE`
 on a build to override the lookup. This repository has no nightly lane of
 its own.
 
-**What runs**: `run.sh` installs LMCache from the commit in
-`UPSTREAM_REVISION` with the RBLN build profile (`BUILD_WITH_RBLN=1`, common
-C++ extensions only, built against the image's torch with `--no-deps`), then
-this checkout as a regular wheel. `preflight.py` checks the NPU, that LMCache
+**What runs**: `run.sh` installs the `lmcache` that `lmcache_inprocess`
+depends on, as RBLN users get it: PyPI's `lmcache` wheel is the CUDA build, so
+it takes the `lmcache==<version>+rbln` wheel from the latest LMCache release's
+`<tag>-rbln` GitHub Release (set `LMCACHE_RBLN_RELEASE`, e.g. `v0.5.8`, to pick
+another), then this checkout as a regular wheel, and fails if that `lmcache`
+does not satisfy the checkout's `lmcache` requirement. Unlike the CUDA
+pipelines it does not use `UPSTREAM_REVISION`: LMCache publishes no RBLN wheel
+per commit. `preflight.py` checks the NPU, that LMCache
 selected the `rbln` backend, and that `lmcache.inprocess` is the installed
 checkout. `tests/inprocess/v1/test_rbln_connector.py` then runs its
 `rbln`-parametrized round trips on real `device='rbln'` KV caches.

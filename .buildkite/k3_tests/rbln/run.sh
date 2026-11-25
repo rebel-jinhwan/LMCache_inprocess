@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# LMCache InProcess RBLN smoke: install LMCache at UPSTREAM_REVISION with the
-# RBLN build profile plus this checkout into the rbln-serve image, check the
-# RBLN runtime, then run the RBLNConnector tests on a real NPU.
+# LMCache InProcess RBLN smoke: install LMCache's released RBLN wheel plus this
+# checkout into the rbln-serve image, check the RBLN runtime, then run the
+# RBLNConnector tests on a real NPU.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

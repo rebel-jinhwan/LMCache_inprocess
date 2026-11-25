@@ -29,8 +29,8 @@ fi
 build_profile="${LMCACHE_CI_BUILD_PROFILE:-}"
 
 if [[ "${build_profile}" == "rbln" ]]; then
-  # The rbln-serve image pins a matched torch-rbln / rebel-compiler pair that a
-  # resolver must not replace, and it ships neither git nor curl.
+  # Install into the rbln-serve image's own environment, next to its
+  # torch-rbln / rebel-compiler pair; the image has neither git nor curl.
   installer=("${python_bin}" -m pip install --no-cache-dir)
 elif [[ -n "${build_profile}" ]]; then
   echo "unknown LMCACHE_CI_BUILD_PROFILE: ${build_profile}" >&2
@@ -41,43 +41,30 @@ else
   installer=("${python_bin}" -m pip install)
 fi
 
-echo "Installing LMCache dependency at ${upstream_revision}"
 if [[ "${build_profile}" == "rbln" ]]; then
-  lmcache_src="$(mktemp -d)"
-  trap 'rm -rf "${lmcache_src}"' EXIT
-  "${python_bin}" - "${upstream_revision}" "${lmcache_src}" <<'PY'
-import io
-import sys
-import tarfile
+  # PyPI's lmcache wheel is the CUDA build. LMCache publishes its RBLN wheel,
+  # built against torch-rbln's torch, to a <tag>-rbln GitHub Release instead.
+  # Install the one a user gets for the `lmcache` dependency: the latest
+  # LMCache release, unless LMCACHE_RBLN_RELEASE names a tag (e.g. v0.5.8).
+  rbln_release="${LMCACHE_RBLN_RELEASE:-$(
+    "${python_bin}" - <<'PY'
 import urllib.request
 
-revision, dest = sys.argv[1:]
-url = f"https://codeload.github.com/LMCache/LMCache/tar.gz/{revision}"
-with urllib.request.urlopen(url, timeout=300) as resp:
-    payload = resp.read()
-with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
-    members = []
-    for member in archive.getmembers():
-        # Drop the archive's single top-level LMCache-<revision>/ directory.
-        _, _, member.name = member.name.partition("/")
-        if member.name:
-            members.append(member)
-    archive.extractall(dest, members=members, filter="data")
+# /releases/latest redirects to /releases/tag/<tag>; no API token needed.
+url = "https://github.com/LMCache/LMCache/releases/latest"
+with urllib.request.urlopen(url, timeout=30) as resp:
+    print(resp.geturl().rstrip("/").rsplit("/", 1)[1])
 PY
+  )}"
+  echo "Installing the LMCache ${rbln_release} RBLN wheel"
   "${installer[@]}" \
-    -r "${lmcache_src}/requirements/build.txt" \
-    -r "${lmcache_src}/requirements/common.txt"
-  # The RBLN profile builds only LMCache's common C++ extensions, against the
-  # image's torch; --no-deps keeps the image's torch-rbln pair untouched. The
-  # tarball has no Git metadata, so setuptools_scm needs the version given.
-  BUILD_WITH_RBLN=1 \
-  SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE="${LMCACHE_CI_VERSION:-0.5.8.dev0+ci}" \
-    "${installer[@]}" --no-deps --no-build-isolation --force-reinstall \
-    "${lmcache_src}"
+    --find-links "https://github.com/LMCache/LMCache/releases/expanded_assets/${rbln_release}-rbln" \
+    "lmcache==${rbln_release#v}+rbln"
   # The checkout may be owned by another user than the job, which hides its
-  # Git metadata from setuptools_scm as well.
+  # Git metadata from setuptools_scm.
   export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE_INPROCESS="${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE_INPROCESS:-0.0.0+ci}"
 else
+  echo "Installing LMCache dependency at ${upstream_revision}"
   "${installer[@]}" \
     "lmcache @ git+https://github.com/LMCache/LMCache.git@${upstream_revision}"
 fi
@@ -88,9 +75,23 @@ echo "Installing the current lmcache_inprocess checkout"
 "${installer[@]}" --no-deps --force-reinstall "${repo_root}"
 
 "${python_bin}" - <<'PY'
+from importlib.metadata import requires, version
+
+from packaging.requirements import Requirement
+
 import lmcache
 import lmcache.inprocess
 
 print(f"LMCache dependency: {lmcache.__file__}")
 print(f"LMCache InProcess checkout: {lmcache.inprocess.__file__}")
+
+# The checkout was installed with --no-deps, so check its lmcache requirement.
+installed = version("lmcache")
+for line in requires("lmcache_inprocess") or []:
+    requirement = Requirement(line)
+    if requirement.name == "lmcache" and not requirement.specifier.contains(
+        installed, prereleases=True
+    ):
+        raise SystemExit(f"lmcache {installed} does not satisfy {requirement}")
+print(f"LMCache {installed} satisfies lmcache_inprocess's requirement")
 PY
