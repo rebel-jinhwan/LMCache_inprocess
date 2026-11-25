@@ -75,3 +75,32 @@ class LookupClientInterface(metaclass=abc.ABCMeta):
             lookup_id: The lookup ID whose status needs to be cleared.
         """
         return
+
+    def outstanding_lookup_ids(self) -> set[str]:
+        """
+        Return the lookups this client still holds state or worker resources
+        for: a cached or awaited result not yet consumed by
+        ``clear_lookup_status``, or a cancelled lookup awaiting cleanup.
+        Synchronous clients, whose callers track their own lookups, return
+        an empty set.
+        """
+        return set()
+
+    def pending_lookup_ids(self) -> set[str]:
+        """
+        Return the lookups whose worker replies have not all arrived. A
+        reply arriving later would repopulate the status, so a caller that
+        drops every lookup (a cache reset) must wait for these first.
+        """
+        return set()
+
+    def discard_lookup(self, lookup_id: str) -> None:
+        """
+        Forget a lookup whose worker-side resources the caller releases
+        itself, so that this client neither reports its result nor sends
+        its cleanup later.
+
+        Args:
+            lookup_id: The lookup ID to forget.
+        """
+        self.clear_lookup_status(lookup_id)

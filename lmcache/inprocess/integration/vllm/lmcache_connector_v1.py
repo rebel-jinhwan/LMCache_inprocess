@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -137,6 +138,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         """Return block IDs that failed to load during the last interval."""
         return self._lmcache_engine.get_block_ids_with_load_errors()
 
+    def build_connector_worker_meta(self) -> Optional[Any]:
+        """Report to the scheduler that this step ran a cache reset's clear."""
+        return self._lmcache_engine.build_connector_worker_meta()
+
     def shutdown(self):
         """
         Shutdown the connector. This is called when the worker process
@@ -191,6 +196,18 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
         return self._lmcache_engine.build_connector_meta(scheduler_output)
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
+        """Track the workers' confirmation of a cache reset."""
+        self._lmcache_engine.update_connector_output(connector_output)
+
+    def reset_cache(self) -> Optional[bool]:
+        """Clear LMCache on every worker (``reset_prefix_cache``).
+
+        The clear runs on a later step; until every worker reports it, LMCache
+        lookups answer 0. See ``LMCacheConnectorV1Impl.reset_cache``.
+        """
+        return self._lmcache_engine.reset_cache()
 
     def request_finished(
         self,

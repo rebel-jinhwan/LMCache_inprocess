@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import math
 import os
 import sys
+import time
 
 # Third Party
 from vllm.config import (
@@ -62,6 +63,28 @@ if TYPE_CHECKING:
     from lmcache.inprocess.v1.lookup_client.abstract_client import LookupClientInterface
 
 logger = init_logger(__name__)
+
+try:
+    # Third Party
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorWorkerMetadata,
+    )
+
+    class LMCacheClearDone(KVConnectorWorkerMetadata):
+        """Worker -> scheduler: this step ran the cache reset's clear.
+
+        Workers clear when they start the flagged step's loads, so once that
+        step's outputs are aggregated every rank has cleared: one report is
+        enough, and each flagged step yields exactly one.
+        """
+
+        def aggregate(
+            self, other: KVConnectorWorkerMetadata
+        ) -> KVConnectorWorkerMetadata:
+            return self
+
+except ImportError:  # vLLM without worker -> scheduler connector metadata
+    LMCacheClearDone = None  # type: ignore[assignment,misc]
 
 
 @dataclass
@@ -438,6 +461,9 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
     # chunks on the workers but before vLLM allocated their blocks. No load
     # or save will ever name them, so the workers unpin them from this list.
     unpin_lookup_ids: set[str] = field(default_factory=set)
+    # A cache reset: workers clear every storage backend on this step, after
+    # releasing unpin_lookup_ids and before any load of the step.
+    clear_cache: bool = False
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -450,6 +476,12 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
 
 
 class LMCacheConnectorV1Impl:
+    # Cache reset state (see reset_cache). Class-level so that connectors
+    # built without _init_connector_state still read "no reset".
+    _reset_pending = False
+    _reset_inflight = 0
+    _reset_ran = False
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -583,6 +615,20 @@ class LMCacheConnectorV1Impl:
         # LMCacheConnectorMetadata.unpin_lookup_ids.
         self._unallocated_sync_lookup_ids: set[str] = set()
         self._abandoned_lookup_ids: set[str] = set()
+
+        # Scheduler: cache reset bookkeeping (see reset_cache).
+        self._reset_waiting_lookup_ids: set[str] = set()
+        self._reset_unpin_lookup_ids: set[str] = set()
+        self._reset_lookup_deadline: Optional[float] = None
+        self._reset_lookup_timeout_s = (
+            float(config.get_extra_config_value("reset_lookup_timeout_ms", 30000))
+            / 1000
+        )
+        if (
+            not math.isfinite(self._reset_lookup_timeout_s)
+            or self._reset_lookup_timeout_s <= 0
+        ):
+            raise ValueError("reset_lookup_timeout_ms must be positive and finite")
 
         # Chunked KV loading: cap the number of external tokens
         # reported per scheduling step to prevent GPU block pool
@@ -793,6 +839,13 @@ class LMCacheConnectorV1Impl:
         if self.lmcache_engine is not None:
             for lookup_id in metadata.unpin_lookup_ids:
                 self.lmcache_engine.lookup_unpin(lookup_id)
+        if metadata.clear_cache:
+            # After the unpins, so pinned chunks do not survive the clear, and
+            # before this step's loads, none of which the scheduler let hit.
+            if self.lmcache_engine is not None:
+                num_tokens = self.lmcache_engine.clear()
+                logger.info("LMCache reset: cleared %d tokens", num_tokens)
+            self._reset_ran = True
 
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
@@ -1395,6 +1448,21 @@ class LMCacheConnectorV1Impl:
         # Ignore DP attention mock requests
         if request.request_id.startswith("mock_req"):
             return 0
+        if self._reset_pending or self._reset_inflight > 0:
+            # A cache reset has not reached every worker yet; the lookup
+            # server would still answer from the chunks the reset drops.
+            self._drain_reset_lookups()
+            if request.request_id in self._reset_waiting_lookup_ids:
+                # A pre-reset prefetch still owns this request's buffers.
+                return None
+            # Record the miss: the request tracker reads vllm_cached_tokens
+            # from it, and 0 LMCache tokens means the prompt is saved anew.
+            self.load_specs[request.request_id] = LoadSpec(
+                vllm_cached_tokens=num_computed_tokens,
+                lmcache_cached_tokens=0,
+                can_load=False,
+            )
+            return 0
         # to handle preempted requests, we want `get_num_new_matched_tokens` to be
         # idempotent under the condition that `update_state_after_alloc` is NOT called
         # then the two side-effects that must be idempotent are:
@@ -1658,6 +1726,12 @@ class LMCacheConnectorV1Impl:
 
         meta = LMCacheConnectorMetadata(unpin_lookup_ids=self._abandoned_lookup_ids)
         self._abandoned_lookup_ids = set()
+        if self._reset_pending and self._drain_reset_lookups():
+            meta.clear_cache = True
+            meta.unpin_lookup_ids |= self._reset_unpin_lookup_ids
+            self._reset_unpin_lookup_ids = set()
+            self._reset_pending = False
+            self._reset_inflight += 1
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
@@ -1877,6 +1951,124 @@ class LMCacheConnectorV1Impl:
                 meta.add_request(req_meta)
 
         return meta
+
+    # ------------------------------------------------------------------
+    # Cache reset (vLLM ``reset_prefix_cache(reset_connector=True)``)
+    #
+    # ``reset_cache`` runs in the scheduler, but the storage backends live in
+    # the workers. The clear rides a later step's connector metadata; each
+    # worker clears at the top of ``start_load_kv``, before any load of that
+    # step, and reports back through ``build_connector_worker_meta``.
+    #
+    # Until that report arrives, lookups answer 0: a lookup in between would
+    # still see the old chunks and promise a load the clear then drops.
+    # Lookups made before the reset for requests not yet scheduled are
+    # cached (lookup client status, ``load_specs``); they are dropped too, or
+    # they would resurface as hits once lookups resume, and the workers
+    # release their pins and prefetch buffers before clearing. Async lookups
+    # still awaiting replies are waited for first, since a late reply would
+    # repopulate the status and its prefetch would hold buffers the clear
+    # cannot reach.
+    # ------------------------------------------------------------------
+
+    def reset_cache(self) -> Optional[bool]:
+        """Schedule a clear of every storage backend on every worker.
+
+        Returns True once the reset is accepted; the clear runs on the first
+        step after pre-reset async lookups have their replies. Returns None
+        on a worker, and False where the reset cannot be confirmed.
+        """
+        if self._role != KVConnectorRole.SCHEDULER:
+            return None
+        if LMCacheClearDone is None or self.lookup_client is None:
+            logger.warning(
+                "LMCache reset is not supported here: %s",
+                "this vLLM has no worker -> scheduler connector metadata"
+                if LMCacheClearDone is None
+                else "the lookup client is not initialized",
+            )
+            return False
+
+        client = self.lookup_client
+        outstanding = (
+            set(self.load_specs)
+            | self._unallocated_sync_lookup_ids
+            | client.outstanding_lookup_ids()
+        )
+        waiting = client.pending_lookup_ids()
+        for lookup_id in outstanding - waiting:
+            client.discard_lookup(lookup_id)
+        # The workers release these with the clear, so they are no longer
+        # abandoned-lookup candidates.
+        self._unallocated_sync_lookup_ids -= outstanding
+        self._reset_unpin_lookup_ids |= outstanding
+        self._reset_waiting_lookup_ids |= waiting
+        if self._reset_waiting_lookup_ids and self._reset_lookup_deadline is None:
+            # A repeated reset must not extend an outstanding wait.
+            self._reset_lookup_deadline = (
+                time.monotonic() + self._reset_lookup_timeout_s
+            )
+        self.load_specs.clear()
+        self._reset_pending = True
+        logger.info(
+            "LMCache reset requested: clearing on a later step "
+            "(dropped %d cached lookups, %d awaiting replies)",
+            len(outstanding),
+            len(self._reset_waiting_lookup_ids),
+        )
+        return True
+
+    def _drain_reset_lookups(self) -> bool:
+        """Forget waited-for lookups whose replies arrived; True once none wait.
+
+        A missing reply fails the reset at its deadline: no cancellation is
+        acknowledged by the workers, so clearing under a running prefetch is
+        not safe.
+        """
+        client = self.lookup_client
+        pending = client.pending_lookup_ids() if client is not None else set()
+        for lookup_id in tuple(self._reset_waiting_lookup_ids):
+            if lookup_id in pending:
+                continue
+            # The reset's unpin owns its worker-side cleanup now.
+            if client is not None:
+                client.discard_lookup(lookup_id)
+            self._reset_waiting_lookup_ids.remove(lookup_id)
+        if not self._reset_waiting_lookup_ids:
+            self._reset_lookup_deadline = None
+            return True
+        if (
+            self._reset_lookup_deadline is not None
+            and time.monotonic() >= self._reset_lookup_deadline
+        ):
+            message = (
+                f"LMCache reset timed out after {self._reset_lookup_timeout_s:g}s "
+                "waiting for async lookup replies: "
+                f"{sorted(self._reset_waiting_lookup_ids)}. Cannot safely clear "
+                "unfinished prefetches; restart the engine."
+            )
+            logger.error(message)
+            raise TimeoutError(message)
+        return False
+
+    def build_connector_worker_meta(self) -> Optional[Any]:
+        """Worker: report that this step ran the reset's clear."""
+        if not self._reset_ran or LMCacheClearDone is None:
+            return None
+        self._reset_ran = False
+        return LMCacheClearDone()
+
+    def update_connector_output(self, connector_output: Any) -> None:
+        """Scheduler: lift the lookup gate once the workers report the clear."""
+        if LMCacheClearDone is None or not isinstance(
+            getattr(connector_output, "kv_connector_worker_meta", None),
+            LMCacheClearDone,
+        ):
+            return
+        # One report per flagged step; lookups resume after the last.
+        self._reset_inflight = max(0, self._reset_inflight - 1)
+        if self._reset_inflight == 0 and not self._reset_pending:
+            logger.info("LMCache reset confirmed by workers; lookups resume")
 
     @_lmcache_nvtx_annotate
     def request_finished(
