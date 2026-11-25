@@ -13,7 +13,8 @@
   `vllm-rbln`) come from the RBLN SDK and must not become package
   dependencies; import them only from that subpackage. It must not import
   `rebel` or the RDS storage plugin, which stays in `lmcache-rbln`: reach the
-  plugin only through `lmcache/inprocess/rbln/_rds_plugin.py`.
+  plugin only through `lmcache/inprocess/rbln/_rds_plugin.py`. Importing it
+  must not monkeypatch LMCache; RBLN runtime patches belong in `lmcache-rbln`.
 - Native extensions are built and shipped by LMCache. This project must remain
   a pure-Python wheel.
 - `NO_NATIVE_EXT=1` LMCache builds are CLI-only and do not define the

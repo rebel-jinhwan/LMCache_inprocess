@@ -21,6 +21,13 @@ Requirements
 - vLLM-RBLN in device-tensor mode (``VLLM_RBLN_USE_VLLM_MODEL=1``, with
   ``VLLM_RBLN_USE_DEVICE_TENSOR`` left at its default), set at process
   start-up.
+- ``lmcache-rbln`` for the RBLN runtime patches to LMCache: a huge-page,
+  device-registered CPU pool, registered staging for MP transfers, and no
+  device copy for an MLA broadcast with a single rank. They apply on
+  ``import lmcache_rbln``, before the engine allocates its CPU pool;
+  vLLM-RBLN's registered ``RBLNLMCacheConnectorV1`` does that import.
+  Without them, transfers from unregistered host memory take the ordinary
+  copy path.
 
 The RDS (NVMe) storage tier is a separate LMCache storage plugin,
 ``RDSBackend``, shipped by ``lmcache-rbln``. The connector does not import it:
