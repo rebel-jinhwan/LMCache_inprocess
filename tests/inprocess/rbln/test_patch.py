@@ -891,84 +891,14 @@ class TestNoMonkeypatch:
         # upstream LMCacheManager should NOT be replaced
         assert manager_module.LMCacheManager.__module__ == manager_module.__name__
 
-
-class TestCpuSlabHugeHost:
-    """``_patch_cpu_slab_huge_host`` routes LMCache's CPU slab through huge host memory.
-
-    The cases it does not own -- shm, zero size, a failed allocation -- must
-    fall through, and its free must not hand upstream's allocator an address it
-    never handed out.
-    """
-
-    @staticmethod
-    def _patched_pair():
-        """Apply the patch over mocked upstream globals; return ``(alloc, free, orig)``.
-
-        Patched in place rather than via ``sys.modules``: ``import a.b.c as x``
-        walks attributes from the real parent package. The replacements are read
-        back inside the patch and outlive it as closures over the mocks.
-        """
-        # Standard
-        from types import SimpleNamespace
-
+    def test_import_does_not_patch_lmcache(self):
+        """The RBLN runtime patches belong to lmcache-rbln, not this package."""
         # First Party
-        from lmcache.inprocess.rbln._patches import _patch_cpu_slab_huge_host
+        import lmcache.inprocess.rbln  # noqa: F401
+        import lmcache.inprocess.v1.cache_engine as cache_engine
         import lmcache.v1.memory_management as mm
 
-        orig = SimpleNamespace(
-            alloc=MagicMock(name="_orig_allocate_cpu_memory"),
-            free=MagicMock(name="_orig_free_cpu_memory"),
-        )
-        with (
-            patch.object(mm, "_allocate_cpu_memory", orig.alloc),
-            patch.object(mm, "_free_cpu_memory", orig.free),
-        ):
-            _patch_cpu_slab_huge_host()
-            return mm._allocate_cpu_memory, mm._free_cpu_memory, orig
-
-    def test_alloc_returns_zeroed_huge_buffer(self):
-        # Third Party
-        import torch
-
-        alloc, _, orig = self._patched_pair()
-        size = 2 * 1024 * 1024
-        buf = alloc(size)
-        assert buf.dtype == torch.uint8
-        assert buf.numel() == size
-        # Huge-page aligned and prefaulted.
-        assert buf.data_ptr() % (2 * 1024 * 1024) == 0
-        assert bool((buf == 0).all())
-        orig.alloc.assert_not_called()
-
-    def test_zero_size_and_shm_fall_through(self):
-        alloc, _, orig = self._patched_pair()
-        alloc(0)
-        alloc(4096, None, "some-shm")
-        assert orig.alloc.call_count == 2
-
-    def test_alloc_failure_falls_back_to_upstream(self):
-        # Third Party
-        import torch_rbln.memory
-
-        # Patch first: the replacement closes over ``huge_host_empty``.
-        with patch.object(
-            torch_rbln.memory,
-            "huge_host_empty",
-            side_effect=MemoryError("no host memory"),
-        ):
-            alloc, _, orig = self._patched_pair()
-            alloc(4096)
-        orig.alloc.assert_called_once()
-
-    def test_free_skips_upstream_for_our_buffer(self):
-        alloc, free, orig = self._patched_pair()
-        free(alloc(4096))
-        orig.free.assert_not_called()
-
-    def test_free_delegates_for_pageable_buffer(self):
-        # Third Party
-        import torch
-
-        _, free, orig = self._patched_pair()
-        free(torch.empty(4096, dtype=torch.uint8))
-        orig.free.assert_called_once()
+        assert mm._allocate_cpu_memory.__module__ == mm.__name__
+        assert mm._free_cpu_memory.__module__ == mm.__name__
+        broadcast = cache_engine.LMCacheEngine._broadcast_or_receive_memory_objs
+        assert broadcast.__module__ == cache_engine.__name__
