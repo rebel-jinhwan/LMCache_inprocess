@@ -59,6 +59,14 @@ The LMCache Standalone Starter allows you to run LMCacheEngine as a standalone s
 
 See :ref:`standalone_starter` for more details.
 
+RBLN NPU
+--------
+
+The ``lmcache.inprocess.rbln`` connector runs the in-process engine under
+vLLM-RBLN on Rebellions RBLN NPUs.
+
+See :ref:`rbln_npu` for more details.
+
 Detailed Examples
 -----------------
 
@@ -67,6 +75,7 @@ Detailed Examples
 
    offload_kv_cache
    share_kv_cache
-   disaggregated_prefill 
+   disaggregated_prefill
    multimodality
    standalone_starter
+   rbln_npu

@@ -8,6 +8,12 @@
   single compatibility shim `lmcache/integration/vllm/vllm_v1_adapter.py` required by vLLM's
   canonical connector import. Do not add `lmcache/__init__.py` or copy shared
   `lmcache/v1/**` modules; those belong to the `lmcache` dependency.
+- `lmcache/inprocess/rbln/**` is the RBLN NPU connector, moved from
+  `rebellions-sw/lmcache-rbln`. Its runtime dependencies (`torch-rbln`,
+  `vllm-rbln`) come from the RBLN SDK and must not become package
+  dependencies; import them only from that subpackage. It must not import
+  `rebel` or the RDS storage plugin, which stays in `lmcache-rbln`: reach the
+  plugin only through `lmcache/inprocess/rbln/_rds_plugin.py`.
 - Native extensions are built and shipped by LMCache. This project must remain
   a pure-Python wheel.
 - `NO_NATIVE_EXT=1` LMCache builds are CLI-only and do not define the
@@ -35,6 +41,8 @@
   plus only the explicitly allowed vLLM compatibility shim outside that tree.
 - Run `python -m pytest -q tests/smoke` after installing a compatible LMCache
   build. Accelerator-specific tests belong on the matching self-hosted runner.
+- `tests/inprocess/rbln` runs on CPU but is collected only when `torch_rbln`
+  and `vllm` are importable; run it in an RBLN SDK environment.
 - For H200 builds of the LMCache dependency, use
   `TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=1` unless broader targets are required.
 - `vllm/vllm-openai:latest` starts `vllm serve`; use `--entrypoint bash` for
