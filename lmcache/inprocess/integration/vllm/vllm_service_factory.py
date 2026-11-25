@@ -74,8 +74,8 @@ class VllmServiceFactory(BaseServiceFactory):
 
         # First Party
         from lmcache.inprocess.integration.vllm.utils import (
-            calculate_draft_layers,
             calculate_local_rank_and_world_size,
+            calculate_stage_draft_layers,
             mla_enabled,
             validate_mla_config,
         )
@@ -99,7 +99,7 @@ class VllmServiceFactory(BaseServiceFactory):
         validate_mla_config(self.lmcache_config, use_mla)
 
         num_layer = model_config.get_num_layers(parallel_config)
-        num_draft_layers = calculate_draft_layers(self.vllm_config)
+        num_draft_layers = calculate_stage_draft_layers(self.vllm_config)
         num_layer += num_draft_layers
         chunk_size = self.lmcache_config.chunk_size
         num_kv_head = model_config.get_num_kv_heads(parallel_config)

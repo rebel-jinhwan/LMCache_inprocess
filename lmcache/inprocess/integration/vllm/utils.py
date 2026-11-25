@@ -32,6 +32,7 @@ __all__ = [
     "apply_mm_hashes_to_token_ids",
     "calculate_draft_layers",
     "calculate_local_rank_and_world_size",
+    "calculate_stage_draft_layers",
     "extract_mm_features",
     "extract_request_configs_from_sampling_params",
     "get_size_bytes",
@@ -235,3 +236,47 @@ def validate_mla_config(config: LMCacheEngineConfig, use_mla: bool) -> None:
         raise ValueError(
             "We haven't supported MLA with Cacheblend yet. Please disable blending."
         )
+
+
+def calculate_stage_draft_layers(vllm_config: "VllmConfig") -> int:
+    """Count the speculative-decoding draft layers this PP stage holds.
+
+    ``calculate_draft_layers`` counts an EAGLE-family draft (``eagle``,
+    ``eagle3``, ``mtp``, ...) as ``draft_model_config.get_num_layers()`` over
+    the *target*'s parallel config, so with ``pipeline_parallel_size > 1`` it
+    splits the draft over the stages as if the draft were part of the target.
+    vLLM does not: its model runner builds the whole drafter on the last PP
+    rank only, with ``pipeline_parallel_size=1``. A one-layer draft over four
+    stages was counted on stage 2, which holds none of it, and DeepSeek-V3.2's
+    MTP at pp=8 was counted on stages that register none of its layers while
+    the last stage was short of them, so ``kv_shape`` disagreed with the KV
+    caches vLLM registers.
+
+    Count the whole draft on the last stage and none elsewhere. At pp=1 this
+    returns what ``calculate_draft_layers`` does.
+    """
+    num_draft_layers = calculate_draft_layers(vllm_config)
+    speculative_config = vllm_config.speculative_config
+    parallel_config = vllm_config.parallel_config
+    pp_size = parallel_config.pipeline_parallel_size
+    if speculative_config is None or pp_size <= 1:
+        return num_draft_layers
+    if not speculative_config.use_eagle():
+        return num_draft_layers
+
+    # Metadata is built before vLLM's distributed groups exist, so
+    # ``get_pp_group()`` is unavailable. Derive the stage the way
+    # ``ModelConfig.get_layers_start_end_indices`` does (layout DP x PP x TP),
+    # so this term and the target's layer count describe the same rank.
+    pp_rank = (parallel_config.rank // parallel_config.tensor_parallel_size) % pp_size
+    if pp_rank != pp_size - 1:
+        return 0
+    try:
+        return speculative_config.draft_model_config.get_total_num_hidden_layers()
+    except Exception:
+        logger.warning(
+            "Failed to read the draft model's layer count; assuming 1 draft "
+            "layer on the last pipeline stage",
+            exc_info=True,
+        )
+        return 1
