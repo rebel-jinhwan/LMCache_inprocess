@@ -5,8 +5,12 @@ Integration with vLLM-RBLN:
     Set ``kv_connector`` to ``RBLNLMCacheConnectorV1`` and
     ``kv_connector_module_path`` to
     ``lmcache.inprocess.rbln.integration.vllm.connector`` in the vLLM KV
-    transfer config. Importing this package applies the RBLN runtime patches
-    (huge-host CPU slab, managed shared-memory registration, ...).
+    transfer config. Importing this package does not patch LMCache.
+
+    The runtime patches RBLN deployments apply to LMCache (huge-host CPU
+    slab, managed shared-memory registration, the single-rank MLA broadcast
+    skip) ship in ``lmcache-rbln`` and take effect on ``import lmcache_rbln``,
+    which must happen before the engine allocates its CPU pool.
 
     The RDS (NVMe) storage tier is a separate LMCache storage plugin shipped
     by ``lmcache-rbln``; see :mod:`lmcache.inprocess.rbln._rds_plugin` for the
@@ -27,8 +31,3 @@ Note:
     touch either env var: ``RBLNLMCacheConnectorV1`` asks the resolved
     platform instead.
 """
-
-# First Party
-from lmcache.inprocess.rbln import _patches
-
-_patches.apply()
