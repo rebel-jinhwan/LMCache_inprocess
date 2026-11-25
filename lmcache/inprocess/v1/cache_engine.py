@@ -480,7 +480,7 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         with store_stats.profile_process_tokens():
-            prev_key = 0
+            prev_key: Optional[int] = None
             for start, end, key in self.token_database.process_tokens(
                 tokens,
                 hashes,
@@ -499,6 +499,10 @@ class LMCacheEngine:
                         "Skipping empty token range [%d, %d) during store", start, end
                     )
                     continue
+                parent_hash = self._parent_chunk_hash(
+                    tokens, start, prev_key, request_configs
+                )
+                prev_key = key.chunk_hash
 
                 # Allocate the memory object
                 num_tokens = end - start
@@ -534,7 +538,7 @@ class LMCacheEngine:
                 if self.kv_events_enabled:
                     stored_event = CacheStoreEvent(
                         block_hashes=[key.chunk_hash],
-                        parent_block_hash=None if start == 0 else prev_key,
+                        parent_block_hash=parent_hash,
                         token_ids=[],
                         block_size=num_tokens,
                         lora_id=None,
@@ -542,10 +546,11 @@ class LMCacheEngine:
                         lora_name=None,
                     )
                     if tokens is not None:
+                        # ``end`` is exclusive; the helper's end is inclusive.
                         stored_event.token_ids = convert_tokens_to_list(
                             tokens,
                             start,
-                            end,
+                            end - 1,
                         )
                         if isinstance(tokens, torch.Tensor):
                             stored_event.medium = tokens.device
@@ -558,7 +563,6 @@ class LMCacheEngine:
                         )
                     )
                     self.kv_events.append(stored_event)
-                    prev_key = key.chunk_hash
 
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:
@@ -675,7 +679,7 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
-        prev_key = 0
+        prev_key: Optional[int] = None
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs
         ):
@@ -690,6 +694,12 @@ class LMCacheEngine:
                     end,
                 )
                 continue
+            # Before the ``contains`` skip: a stored chunk's parent is the chunk
+            # right before it, whether or not this call stores that one.
+            parent_hash = self._parent_chunk_hash(
+                tokens, start, prev_key, request_configs
+            )
+            prev_key = key.chunk_hash
 
             keys_multi_layer = key.split_layers(self.num_layers)
             # Only check the first layer
@@ -727,7 +737,7 @@ class LMCacheEngine:
             if self.kv_events_enabled and tokens is not None:
                 stored_event = CacheStoreEvent(
                     block_hashes=[key.chunk_hash],
-                    parent_block_hash=None if start == 0 else prev_key,
+                    parent_block_hash=parent_hash,
                     token_ids=[],
                     block_size=num_tokens,
                     lora_id=None,
@@ -735,10 +745,11 @@ class LMCacheEngine:
                     lora_name=None,
                 )
                 if tokens is not None:
+                    # ``end`` is exclusive; the helper's end is inclusive.
                     stored_event.token_ids = convert_tokens_to_list(
                         tokens,
                         start,
-                        end,
+                        end - 1,
                     )
                     if isinstance(tokens, torch.Tensor):
                         stored_event.medium = tokens.device
@@ -747,7 +758,6 @@ class LMCacheEngine:
                     stored_event,
                 )
                 self.kv_events.append(stored_event)
-                prev_key = key.chunk_hash
 
         if keys:
             # Transpose the keys and memory objects into layer major format
@@ -1835,6 +1845,36 @@ class LMCacheEngine:
                         memory_obj.ref_count_down()
             reordered_chunks = kept_chunks
         return reordered_chunks, tot_kv_size
+
+    def _parent_chunk_hash(
+        self,
+        tokens: Optional[Union[torch.Tensor, List[int]]],
+        start: int,
+        prev_key: Optional[int],
+        request_configs: Optional[dict],
+    ) -> Optional[int]:
+        """Hash of the chunk that ends at ``start``, for a KV event's parent.
+
+        ``prev_key`` is the previous chunk this walk produced. When a mask
+        skipped the chunks before ``start``, it is unset and the parent is
+        hashed from the skipped prefix: a cache-aware router keys a chain by
+        its parents, and reads a missing parent as the start of a prompt.
+        Without tokens (a store by hashes) the prefix cannot be hashed and the
+        parent stays 0, as before.
+        """
+        if start == 0:
+            return None
+        if prev_key is not None:
+            return prev_key
+        if tokens is None:
+            return 0
+        parent = 0
+        for _, _, chunk_hash in self.token_database.process_tokens(
+            tokens[:start], make_key=False, request_configs=request_configs
+        ):
+            assert isinstance(chunk_hash, int)
+            parent = chunk_hash
+        return parent
 
     def _broadcast_or_receive_memory_objs(
         self,
