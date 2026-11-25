@@ -1,0 +1,31 @@
+# RBLN hardware smoke for the InProcess RBLNConnector.
+# rbln-queue is served by agent-stack-k8s: each job is a pod, and the NPU is
+# allocated through DRA from the buildkite/npu1 ResourceClaimTemplate.
+
+env:
+  LMCACHE_TRACK_USAGE: "false"
+
+steps:
+  - label: "RBLN InProcess Hardware Smoke"
+    key: "rbln_inprocess_hardware_smoke"
+    command: bash .buildkite/k3_tests/rbln/run.sh
+    timeout_in_minutes: 60
+    agents:
+      queue: "rbln-queue"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - name: container-0
+                # Set by upload-pipeline.sh: the last rbln-serve image
+                # LMCache's RBLN nightly lane verified.
+                image: ${RBLN_SERVE_IMAGE}
+                securityContext:
+                  # The image runs as uid 2000, which cannot write /opt/venv.
+                  runAsUser: 0
+                resources:
+                  claims:
+                    - name: npu
+            resourceClaims:
+              - name: npu
+                resourceClaimTemplateName: npu1

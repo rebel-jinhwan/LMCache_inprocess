@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU tests for the RBLN NPU connector.
+"""Tests for the RBLN NPU connector.
 
 ``RBLNConnector`` moves KV with plain torch ops, so CPU tensors stand in for
 the ``device='rbln'`` KV caches vLLM-RBLN allocates: the 6-D attention cache
 ``[2, num_blocks, num_kv_heads, 1, block_size, head_dim]`` and the 3-D MLA
-latent cache ``[num_blocks, block_size, head_size]``.
+latent cache ``[num_blocks, block_size, head_size]``. Where torch-rbln sees an
+NPU (the RBLN Buildkite pipeline), the round trip also runs on real
+``device='rbln'`` caches, which takes the torch-rbln staging path.
 """
 
 # Standard
@@ -25,6 +27,23 @@ NUM_KV_HEADS = 2
 HEAD_DIM = 8
 BLOCK_SIZE = 16
 NUM_BLOCKS = 4
+
+
+def _rbln_device_count() -> int:
+    """Return how many NPUs torch-rbln sees, or 0 without torch-rbln."""
+    rbln = getattr(torch, "rbln", None)
+    return rbln.device_count() if rbln is not None else 0
+
+
+KV_DEVICES = [
+    "cpu",
+    pytest.param(
+        "rbln",
+        marks=pytest.mark.skipif(
+            _rbln_device_count() == 0, reason="needs torch-rbln and an RBLN NPU"
+        ),
+    ),
+]
 
 
 def _metadata(use_mla: bool = False) -> SimpleNamespace:
@@ -55,8 +74,31 @@ def _chunk(tensor: torch.Tensor) -> SimpleNamespace:
     return SimpleNamespace(tensor=tensor)
 
 
+def _kv_cache(shape: tuple[int, ...], fill: float, device: str) -> torch.Tensor:
+    """A KV cache filled with ``fill``, allocated on ``device``.
+
+    On RBLN, ``torch.empty`` and ``torch.zeros`` only reserve the tensor: the
+    runtime places it on the NPU later. vLLM-RBLN's caches are bound to device
+    memory, and ``set_device_layout_like`` needs a bound reference, so the
+    cache is bound before the values are uploaded.
+    """
+    host = torch.full(shape, fill, dtype=torch.float16)
+    if device == "cpu":
+        return host
+    # Third Party
+    from torch_rbln.memory import bind_device_memory
+
+    cache = torch.empty(shape, dtype=torch.float16, device=device)
+    bind_device_memory(cache)
+    cache.copy_(host)
+    return cache
+
+
 def _kv_caches(
-    use_mla: bool = False, fill: float = 0.0, blocks_first: bool = False
+    use_mla: bool = False,
+    fill: float = 0.0,
+    blocks_first: bool = False,
+    device: str = "cpu",
 ) -> list[torch.Tensor]:
     if use_mla:
         shape: tuple[int, ...] = (NUM_BLOCKS, BLOCK_SIZE, HEAD_DIM)
@@ -64,7 +106,7 @@ def _kv_caches(
         shape = (NUM_BLOCKS, 2, NUM_KV_HEADS, 1, BLOCK_SIZE, HEAD_DIM)
     else:
         shape = (2, NUM_BLOCKS, NUM_KV_HEADS, 1, BLOCK_SIZE, HEAD_DIM)
-    return [torch.full(shape, fill, dtype=torch.float16) for _ in range(NUM_LAYERS)]
+    return [_kv_cache(shape, fill, device) for _ in range(NUM_LAYERS)]
 
 
 class TestCreateGPUConnector:
@@ -131,6 +173,7 @@ def test_rejects_negative_slots() -> None:
         )
 
 
+@pytest.mark.parametrize("device", KV_DEVICES)
 @pytest.mark.parametrize("use_mla", [False, True])
 @pytest.mark.parametrize(
     "slots",
@@ -142,11 +185,11 @@ def test_rejects_negative_slots() -> None:
     ],
     ids=["full", "partial", "scattered", "two-blocks"],
 )
-def test_round_trip(use_mla: bool, slots: list[int]) -> None:
+def test_round_trip(use_mla: bool, slots: list[int], device: str) -> None:
     """The vLLM adapter never registers the caches; each transfer passes them
     as ``kvcaches``."""
     sentinel = 7.0
-    kv_caches = _kv_caches(use_mla, fill=sentinel)
+    kv_caches = _kv_caches(use_mla, fill=sentinel, device=device)
     connector = RBLNConnector.from_metadata(_metadata(use_mla))
     num_tokens = len(slots)
     slot_mapping = torch.tensor(slots, dtype=torch.long)
@@ -169,6 +212,7 @@ def test_round_trip(use_mla: bool, slots: list[int]) -> None:
     written = torch.zeros(NUM_BLOCKS * BLOCK_SIZE, dtype=torch.bool)
     written[slot_mapping] = True
     for kv in kv_caches:
+        kv = kv.cpu()
         token_major = kv if use_mla else kv.permute(1, 4, 0, 2, 3, 5)
         per_token = token_major.reshape(NUM_BLOCKS * BLOCK_SIZE, -1)
         assert torch.all(per_token[~written] == sentinel)

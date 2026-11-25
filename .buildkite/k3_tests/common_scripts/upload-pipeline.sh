@@ -60,5 +60,12 @@ if should_skip_ci "${PIPELINE_FILE}"; then
     exit 0
 fi
 
+if [[ "${PIPELINE_FILE}" == */rbln/pipeline.yml ]]; then
+    # Run on the last rbln-serve image LMCache's RBLN nightly lane verified.
+    # shellcheck source=.buildkite/k3_harness/resolve-pinned-vllm.sh
+    source "${SCRIPT_DIR}/../../k3_harness/resolve-pinned-vllm.sh"
+    export RBLN_SERVE_IMAGE="${PINNED_RBLN_IMAGE}"
+fi
+
 echo "--- :pipeline: Uploading ${PIPELINE_FILE}"
 exec buildkite-agent pipeline upload "${PIPELINE_FILE}"
