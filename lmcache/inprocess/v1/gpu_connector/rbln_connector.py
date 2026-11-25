@@ -19,35 +19,267 @@ cache is 3-D (``[num_blocks, block_size, head_size]``) and the chunk's leading
 axis is 1.  The gather/scatter sites index it directly under
 ``if self.use_mla``; the surrounding block grouping, contiguity handling and
 ``torch._foreach_copy_`` batching are shared with the K/V path.
+
+Host memory registration is left to the deployment:
+:meth:`RBLNConnector.register_host_buffer` registers nothing here, so every
+transfer takes the ordinary copy path. lmcache-rbln replaces it to register
+its huge-host CPU pools on the consuming device.
+
+The head-major gather/scatter kernels below handle the whole-block case (every
+gathered block contributes all ``block_size`` slots), which is the fast path.
+Partial-offset gathers stay in ``RBLNConnector`` because they arise only from
+the token-precise offload slot_mapping; the pure layout arithmetic they share
+is :func:`slot_runs` and :func:`kernel_block_slabs`.
 """
 
 # Standard
 from collections import defaultdict
-from typing import List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, List, Optional, Sequence, Union
 import math
+import os
 
 # Third Party
 from typing_extensions import override
 import torch
 
 # First Party
-from lmcache.inprocess.rbln._host_memory import ensure_cpu_pool_registered
 from lmcache.inprocess.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.logging import init_logger
 from lmcache.v1.memory_management import MemoryObj
 
-# Local
-from .kv_ops import (
-    as_kv_first,
-    full_block_scatter_pairs,
-    gather_full_blocks_headmajor,
-    kernel_block_slabs,
-    scatter_headmajor_to_full_blocks,
-    slot_runs,
-    split_kv_copy_enabled,
-)
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.inprocess.v1.metadata import LMCacheMetadata
 
 logger = init_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Head-major KV gather/scatter kernels
+#
+# The native RBLN KV cache is 6-D ``[2, num_blocks, num_kv_heads, 1,
+# block_size, head_dim]`` (heads before block tokens = HND); a chunk is
+# head-major ``[2, L, H, T, D]``, with NO head<->token transpose. MLA caches
+# are 3-D ``[num_blocks, block_size, head_size]`` and produce a
+# ``[1, L, 1, T, D]`` chunk.
+# ---------------------------------------------------------------------------
+
+
+def as_kv_first(kv_cache: torch.Tensor) -> torch.Tensor:
+    """Return a ``[2, NB, NH, 1, BS, HD]`` view of a paged attention KV cache.
+
+    vLLM-RBLN allocates ``num_blocks`` ahead of the K/V axis
+    (``[NB, 2, NH, 1, BS, HD]``) on the rbln_custom_ops path, which is its
+    default, and behind it on rbln_triton_ops (RBLN-SW/vllm-rbln#1114). Every
+    gather/scatter site here indexes the K/V-first form, so a blocks-first
+    tensor is transposed back once at registration -- stride-only, no copy,
+    and the two axes it swaps are the outermost, so each indexed plane below
+    is exactly as contiguous as before.
+
+    Args:
+        kv_cache: Per-layer KV tensor in either 6-D attention layout, or an
+            MLA cache (3-D), which has no K/V axis and is returned unchanged.
+
+    Returns:
+        torch.Tensor: A K/V-first view, or ``kv_cache`` itself when it already
+        is one. Idempotent, so callers may apply it more than once.
+
+    Note:
+        A two-block cache is shape-identical under both layouts and is read as
+        K/V-first. vLLM allocates orders of magnitude more blocks than that.
+    """
+    if kv_cache.ndim == 6 and kv_cache.shape[1] == 2 and kv_cache.shape[0] != 2:
+        return kv_cache.transpose(0, 1)
+    return kv_cache
+
+
+def split_kv_copy_enabled() -> bool:
+    """Whether to copy K and V halves separately (``LMCACHE_RBLN_SPLIT_KV_COPY``).
+
+    Writing ``dst.copy_(torch.stack([k, v]))`` in one shot can corrupt a half
+    through the underlying v2v stack-pair copy on some RBLN geometries; the
+    split copy makes each half byte-exact. Gated so both paths can be A/B'd.
+    """
+    return bool(os.environ.get("LMCACHE_RBLN_SPLIT_KV_COPY"))
+
+
+def gather_full_blocks_headmajor(
+    kv_caches: Sequence[torch.Tensor],
+    block_ids: Sequence[int],
+    dst: torch.Tensor,
+) -> None:
+    """Gather whole paged blocks into a head-major chunk ``dst``.
+
+    Args:
+        kv_caches: Per-layer KV tensors, each 6-D
+            ``[2, num_blocks, num_kv_heads, 1, block_size, head_dim]`` on device,
+            or 3-D ``[num_blocks, block_size, head_size]`` under MLA.
+        block_ids: Block indices to gather, in chunk-token order.
+        dst: Destination chunk view shaped
+            ``[2, L, H, len(block_ids) * block_size, D]``
+            (``[1, L, 1, ...]`` for MLA). May be on device (D2D) or CPU (D2H).
+
+    Reads are batched into a single ``torch._foreach_copy_``, mirroring
+    :func:`scatter_headmajor_to_full_blocks`.
+    """
+    # One pair per (block, layer, half), straight from the paged KV — the
+    # stack/cat form this replaces built a chunk-sized device tensor first, so
+    # the payload moved twice. A multi-block chunk makes the destination views
+    # strided and the batch falls to a sequential loop; splitting the head axis
+    # would keep it, but at 8x the descriptors that measures slower (see the
+    # commit). The single-block chunk the serve uses is contiguous either way.
+    mla = kv_caches[0].ndim == 3
+    block_size = kv_caches[0].shape[1 if mla else 4]
+    dsts: List[torch.Tensor] = []
+    srcs: List[torch.Tensor] = []
+    for i, b in enumerate(block_ids):
+        tok = slice(i * block_size, (i + 1) * block_size)
+        for layer_idx, kv in enumerate(kv_caches):
+            if mla:
+                # kv: [NB, BS, HS], dst: [1, L, 1, T, HS]
+                dsts.append(dst[0, layer_idx][0, tok, :])
+                srcs.append(kv[b])
+            else:
+                for half in (0, 1):
+                    dsts.append(dst[half, layer_idx][:, tok, :])
+                    srcs.append(kv[half, b, :, 0, :])
+    if dsts:
+        torch._foreach_copy_(dsts, srcs)
+
+
+def scatter_headmajor_to_full_blocks(
+    kv_caches: Sequence[torch.Tensor],
+    block_ids: Sequence[int],
+    src: torch.Tensor,
+    skip_prefix_n_blocks: int = 0,
+) -> None:
+    """Scatter a head-major chunk ``src`` back into whole paged blocks.
+
+    Args:
+        kv_caches: Per-layer KV tensors, each 6-D
+            ``[2, num_blocks, num_kv_heads, 1, block_size, head_dim]`` on device,
+            or 3-D ``[num_blocks, block_size, head_size]`` under MLA.
+        block_ids: Destination block indices, in chunk-token order.
+        src: Source chunk shaped ``[2, L, H, len(block_ids) * block_size, D]``
+            (``[1, L, 1, ...]`` for MLA).
+        skip_prefix_n_blocks: Leading blocks already present in the KV cache;
+            neither read from ``src`` nor written (whole-block prefix skip).
+
+    Writes are batched into a single ``torch._foreach_copy_``.
+    """
+    dsts, srcs = full_block_scatter_pairs(
+        kv_caches, block_ids, src, skip_prefix_n_blocks
+    )
+    if dsts:
+        torch._foreach_copy_(dsts, srcs)
+
+
+def full_block_scatter_pairs(
+    kv_caches: Sequence[torch.Tensor],
+    block_ids: Sequence[int],
+    src: torch.Tensor,
+    skip_prefix_n_blocks: int = 0,
+) -> tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """The ``(cache view, src view)`` pairs that
+    :func:`scatter_headmajor_to_full_blocks` copies, for a caller that batches
+    several cache groups into one ``torch._foreach_copy_``."""
+    mla = kv_caches[0].ndim == 3
+    block_size = kv_caches[0].shape[1 if mla else 4]
+    dsts: List[torch.Tensor] = []
+    srcs: List[torch.Tensor] = []
+    for i, b in enumerate(block_ids):
+        if i < skip_prefix_n_blocks:
+            continue
+        s = src[:, :, :, i * block_size : (i + 1) * block_size, :]
+        for layer_idx, kv in enumerate(kv_caches):
+            if mla:
+                # kv: [NB, BS, HS], src: [1, L, 1, T, HS]
+                dsts.append(kv[b])
+                srcs.append(s[0, layer_idx, 0])
+            else:
+                dsts.append(kv[0, b, :, 0, :])
+                srcs.append(s[0, layer_idx])
+                dsts.append(kv[1, b, :, 0, :])
+                srcs.append(s[1, layer_idx])
+    return dsts, srcs
+
+
+def slot_runs(slots: list[int], kernel_size: int) -> list[tuple[int, int, int, int]]:
+    """Split the slots into ``(block, offset, token, stop)`` runs.
+
+    A run is the longest stretch of chunk tokens whose slots are consecutive
+    inside one kernel block, and it also ends at multiples of ``kernel_size``
+    in chunk tokens, so it stays inside one chunk kernel block (one slab of
+    :func:`kernel_block_slabs`). A run of ``kernel_size`` tokens is therefore a
+    whole kernel block on both sides: ``offset`` is 0 and ``token`` a multiple
+    of ``kernel_size``. Negative slots belong to reclaimed sliding-window
+    blocks and are left out.
+    """
+    runs: list[tuple[int, int, int, int]] = []
+    token = 0
+    while token < len(slots):
+        slot = slots[token]
+        if slot < 0:
+            token += 1
+            continue
+        block, offset = divmod(slot, kernel_size)
+        stop = token + 1
+        while (
+            stop < len(slots)
+            and offset + stop - token < kernel_size
+            and slots[stop] == slot + stop - token
+            and stop % kernel_size
+        ):
+            stop += 1
+        runs.append((block, offset, token, stop))
+        token = stop
+    return runs
+
+
+def kernel_block_slabs(plane: torch.Tensor, kernel_block: int) -> list[torch.Tensor]:
+    """The ``[H, w, D]`` slabs a grouped chunk plane is stored as, in order.
+
+    A grouped chunk keeps every layer plane (``[H, T, D]`` elements) as
+    consecutive ``[H, w, D]`` slabs, one per ``kernel_block`` chunk tokens
+    (``w`` is ``kernel_block`` except for a shorter last slab). Each full slab
+    has exactly the layout of one cache kernel block, so a whole block moves as
+    one contiguous copy instead of one per head. When ``kernel_block`` covers
+    the whole chunk the one slab is the plain ``[H, T, D]`` plane. Chunk token
+    ``t`` sits in slab ``t // kernel_block``, column ``t % kernel_block``.
+
+    This is a stored format. The order depends on each layer's kernel block
+    size, which vllm-rbln chooses (128 = the window for GPT-OSS SWA layers by
+    default, the manager block under sub-block caching). Chunk keys do not
+    record it, so every worker that shares a store must run the same SWA kernel
+    block size. Chunks written before this layout (release-v0.12.0 wrote
+    token-major SWA planes) read back scrambled: flush any persistent store
+    shared across that upgrade.
+
+    Args:
+        plane: A contiguous ``[H, T, D]`` chunk plane.
+        kernel_block: Kernel block size of the layer the plane belongs to.
+    """
+    if not plane.is_contiguous():
+        # Slabs are runs of the plane's memory. Views over a strided plane
+        # would follow its logical order instead, and ``reshape`` would hand
+        # back a copy that the transfer fills instead of the chunk.
+        raise ValueError("kernel_block_slabs needs a contiguous [H, T, D] plane")
+    heads, tokens, dim = plane.shape
+    full, tail = divmod(tokens, kernel_block)
+    if not tail:
+        # One view op per plane: this runs for every layer and K/V half of a
+        # chunk, and the three of the tail path cost GPT-OSS ~0.1 ms a chunk.
+        return list(plane.view(full, heads, kernel_block, dim).unbind(0))
+    split = full * heads * kernel_block * dim
+    flat = plane.view(-1)
+    slabs = list(flat[:split].view(full, heads, kernel_block, dim).unbind(0))
+    slabs.append(flat[split:].view(heads, tail, dim))
+    return slabs
+
+
+# ---------------------------------------------------------------------------
+# Connector
+# ---------------------------------------------------------------------------
 
 
 def sized_head_groups(groups: Sequence[Sequence[int]]) -> bool:
@@ -250,12 +482,61 @@ class RBLNConnector(GPUConnectorInterface):
         per block group.
 
         Under per-layer cache groups (HMA) each ``[H, T, D]`` layer plane holds
-        its elements kernel-block-major (:func:`~.kv_ops.kernel_block_slabs`):
+        its elements kernel-block-major (:func:`kernel_block_slabs`):
         axis 3 is the chunk token axis only for a layer whose kernel block
         covers the chunk."""
         return self._token_shapes(num_tokens) + [
             torch.Size([1, n, *shape]) for n, shape, _, _ in self.block_groups
         ]
+
+    @classmethod
+    def from_metadata(
+        cls,
+        metadata: "LMCacheMetadata",
+        use_gpu: bool = False,
+        device: Optional[torch.device] = None,
+        slot_registration: bool = False,
+    ) -> "RBLNConnector":
+        """Create a connector from the RBLN engine metadata.
+
+        ``metadata`` is the ``RBLNLMCacheMetadata`` that ``RBLNServiceFactory``
+        builds: besides ``kv_shape`` it records the vLLM block size and the
+        chunk's KV head, aux and block groups. ``use_gpu`` and ``device`` keep
+        ``CreateGPUConnector``'s signature and are unused: the connector
+        stages on the device of the KV caches vLLM registers.
+        ``slot_registration`` registers CPU pools on the allocator's object
+        grid, which only holds without unfull chunks.
+        """
+        block_size = getattr(metadata, "block_size", None)
+        if block_size is None:
+            raise ValueError(
+                "RBLNConnector needs the vLLM block size in the engine metadata; "
+                "configure vLLM with RBLNLMCacheConnectorV1, whose service "
+                "factory records it"
+            )
+        kv_head_groups = list(getattr(metadata, "kv_head_groups", None) or [])
+        kv_head_size = getattr(metadata, "kv_head_size", None)
+        num_layers = metadata.kv_shape[0]
+        num_kv_heads = metadata.kv_shape[3]
+        head_dim = metadata.kv_shape[4]
+        sized = sized_head_groups(kv_head_groups)
+        if kv_head_size is not None or sized:
+            # kv_shape only sizes the CPU budget here; the groups have the rest.
+            num_layers = sum(g[0] for g in kv_head_groups)
+            num_kv_heads = kv_head_groups[0][1] if kv_head_groups else 1
+            head_dim = kv_head_groups[0][2] if sized else kv_head_size
+        return cls(
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+            dtype=getattr(metadata, "kv_buffer_dtype", None) or metadata.kv_dtype,
+            use_mla=metadata.use_mla,
+            kv_head_groups=kv_head_groups,
+            aux_groups=getattr(metadata, "aux_groups", None),
+            slot_registration=slot_registration,
+            block_groups=getattr(metadata, "block_groups", None),
+        )
 
     def _token_shapes(self, num_tokens: int) -> list[torch.Size]:
         return self._head_shapes(num_tokens) + [
@@ -291,7 +572,7 @@ class RBLNConnector(GPUConnectorInterface):
         num_kv_heads, 1, block_size, head_dim]`` or the blocks-first
         ``[num_blocks, 2, ...]`` vLLM-RBLN allocates by default -- or
         ``[num_blocks, block_size, head_size]`` under MLA. Blocks-first
-        tensors are stored as :func:`~.kv_ops.as_kv_first` views so the
+        tensors are stored as :func:`as_kv_first` views so the
         transfer paths index one layout; MLA caches are stored as-is.
 
         ``aux_kv_caches`` holds one layer-ordered list per ``aux_groups`` entry.
@@ -594,8 +875,25 @@ class RBLNConnector(GPUConnectorInterface):
         # unchanged; all gather/scatter variants below consume these views.
         allocation = self._pool_allocation(memory_obj)
         for view in views:
-            ensure_cpu_pool_registered(view, self._device, allocation)
+            self.register_host_buffer(view, allocation)
         return views
+
+    def register_host_buffer(
+        self, buffer: torch.Tensor, allocation: Optional[tuple[int, int]] = None
+    ) -> bool:
+        """Whether one registered host range covers ``buffer`` on this device.
+
+        ``buffer`` is a host chunk about to be transferred to or from the KV
+        caches on ``self._device``; ``allocation`` is its object's
+        ``(address, aligned size)`` when the allocator keeps a fixed object
+        grid (``slot_registration``). A covered buffer is gathered into with
+        one 6-D block transfer; otherwise each block is copied directly.
+
+        This connector registers nothing and returns False. lmcache-rbln
+        replaces this method to register its huge-host CPU pools on the
+        consuming device.
+        """
+        return False
 
     def _pool_allocation(self, memory_obj: MemoryObj) -> Optional[tuple[int, int]]:
         """``(address, aligned size)`` of the object's whole allocator slot."""
@@ -629,7 +927,7 @@ class RBLNConnector(GPUConnectorInterface):
         Returns ``(cache_pieces, chunk_pieces)``: each pair is the same elements
         on both sides.
 
-        A chunk plane is kernel-block-major (:func:`~.kv_ops.kernel_block_slabs`).
+        A chunk plane is kernel-block-major (:func:`kernel_block_slabs`).
         A cache kernel block is ``[H, W, D]`` contiguous, so a whole block maps
         onto one chunk slab and moves as one copy: with GPT-OSS's 128-token SWA
         blocks a token-major chunk took 2592 head-sized copies, whose per-copy
@@ -910,7 +1208,7 @@ class RBLNConnector(GPUConnectorInterface):
             all_full
             and not mla
             and len(block_groups) == 1
-            and ensure_cpu_pool_registered(dst, self._device)
+            and self.register_host_buffer(dst)
         )
         if all_full and not gather_for_host:
             gather_full_blocks_headmajor(kv_caches, list(block_groups), dst)
@@ -1098,7 +1396,7 @@ class RBLNConnector(GPUConnectorInterface):
         #   * scattered: one per-slot integer-index view (basic index →
         #     writable view; fancy index would return a copy).
         # Fast path: every group is a whole block — use the head-major kernel
-        # in kv_ops. Partial/scattered slots stay inline below; 3-D groups
+        # above. Partial/scattered slots stay inline below; 3-D groups
         # move run by run, like their gather.
         if all_full:
             scatter_headmajor_to_full_blocks(kv_caches, list(block_groups), src)
