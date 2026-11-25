@@ -33,14 +33,15 @@
 #   PINNED_VLLM_FULL_SHA        -- 40-char commit SHA, if recorded in pin
 #   PINNED_VLLM_ARCHIVE_INDEX_URL
 #                               -- permanent PEP 503 simple index, if recorded
-#   PINNED_RBLN_IMAGE           -- RBLN rbln-serve image (never empty)
+#   PINNED_RBLN_IMAGE           -- RBLN rbln-serve image (empty without a
+#                                  verified record)
 #
 # The script never fails the build: a missing/unreachable pin file just
 # falls through to the unpinned path, mirroring the previous behaviour.
 #
 # Image resolution selects the latest Buildkite-verified digest of each
 # runtime from LMCache's tested_runtimes.jsonl. Without one, XPU uses the
-# configured stable release image and RBLN the configured fallback image.
+# configured stable release image; RBLN stays empty.
 # LMCache's rbln-mp-nightly lane appends the RBLN records after its hardware
 # smoke passes, so this repository follows the same verified rbln-serve image
 # as LMCache's own RBLN PR builds.
@@ -111,8 +112,6 @@ USE_PINNED_XPU_RUNTIME="${USE_PINNED_XPU_RUNTIME:-true}"
 XPU_RELEASE_IMAGE="${XPU_RELEASE_IMAGE:-vllm/vllm-openai-xpu:v0.26.0}"
 PINNED_RBLN_IMAGE="${PINNED_RBLN_IMAGE:-}"
 USE_PINNED_RBLN_RUNTIME="${USE_PINNED_RBLN_RUNTIME:-true}"
-# Used until LMCache's RBLN nightly lane pins its first verified image.
-RBLN_FALLBACK_IMAGE="${RBLN_FALLBACK_IMAGE:-harbor.k8s.rebellions.in/rebellions-sw/rbln-serve:0.12.0rc0-ubuntu24.04-py3.12}"
 LMCACHE_RUNTIME_HISTORY_URL="${LMCACHE_RUNTIME_HISTORY_URL:-${LMCACHE_XPU_RUNTIME_HISTORY_URL:-https://raw.githubusercontent.com/LMCache/LMCache/buildkite_latest_tested_vllm/tested_runtimes.jsonl}}"
 
 # Print the image_ref of the last Buildkite-tested, digest-pinned record of
@@ -159,8 +158,7 @@ if [[ -z "${PINNED_RBLN_IMAGE}" && "${USE_PINNED_RBLN_RUNTIME}" == "true" ]]; th
     PINNED_RBLN_IMAGE="$(latest_image_from_history "${runtime_history}" rbln linux-rebellions-rbln)"
 fi
 if [[ -z "${PINNED_RBLN_IMAGE}" ]]; then
-    PINNED_RBLN_IMAGE="${RBLN_FALLBACK_IMAGE}"
-    echo "[resolve-pinned-vllm] No verified RBLN nightly image; using fallback ${PINNED_RBLN_IMAGE}" >&2
+    echo "[resolve-pinned-vllm] No verified RBLN nightly image" >&2
 else
     echo "[resolve-pinned-vllm] Using pinned RBLN image: ${PINNED_RBLN_IMAGE}" >&2
 fi

@@ -64,6 +64,10 @@ if [[ "${PIPELINE_FILE}" == */rbln/pipeline.yml ]]; then
     # Run on the last rbln-serve image LMCache's RBLN nightly lane verified.
     # shellcheck source=.buildkite/k3_harness/resolve-pinned-vllm.sh
     source "${SCRIPT_DIR}/../../k3_harness/resolve-pinned-vllm.sh"
+    if [[ -z "${PINNED_RBLN_IMAGE}" ]]; then
+        echo "No verified rbln-serve image: set PINNED_RBLN_IMAGE on the build" >&2
+        exit 1
+    fi
     export RBLN_SERVE_IMAGE="${PINNED_RBLN_IMAGE}"
 fi
 

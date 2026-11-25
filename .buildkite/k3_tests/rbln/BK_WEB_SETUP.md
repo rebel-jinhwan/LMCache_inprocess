@@ -21,9 +21,10 @@ pull secret for it.
 **Image selection**: `upload-pipeline.sh` sets the step's image to the last
 `rbln-serve` image LMCache's `rbln-mp-nightly` lane verified, read from
 `tested_runtimes.jsonl` on LMCache's `buildkite_latest_tested_vllm` branch by
-`k3_harness/resolve-pinned-vllm.sh`. Until the first nightly pin it uses
-`RBLN_FALLBACK_IMAGE` there. Set `PINNED_RBLN_IMAGE` on a build to override
-it. This repository has no nightly lane of its own.
+`k3_harness/resolve-pinned-vllm.sh`. There is no fallback image: when no
+verified record can be read, the upload step fails. Set `PINNED_RBLN_IMAGE`
+on a build to override the lookup. This repository has no nightly lane of
+its own.
 
 **What runs**: `run.sh` installs LMCache from the commit in
 `UPSTREAM_REVISION` with the RBLN build profile (`BUILD_WITH_RBLN=1`, common
