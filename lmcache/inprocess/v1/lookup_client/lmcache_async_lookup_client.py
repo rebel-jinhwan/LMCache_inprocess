@@ -260,6 +260,26 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         """Mark lookup as aborted. Cleanup will happen after task finishes."""
         self.aborted_lookups.add(lookup_id)
 
+    def outstanding_lookup_ids(self) -> set[str]:
+        with self.lock:
+            return set(self.reqs_status) | self.aborted_lookups
+
+    def pending_lookup_ids(self) -> set[str]:
+        # A timed-out lookup is cancelled and may then have its status cleared
+        # when vLLM allocates the request; it still awaits its replies.
+        with self.lock:
+            return {
+                lookup_id
+                for lookup_id in set(self.reqs_status) | self.aborted_lookups
+                if self.reqs_status.get(lookup_id) is None
+            }
+
+    def discard_lookup(self, lookup_id: str) -> None:
+        with self.lock:
+            self.reqs_status.pop(lookup_id, None)
+            self.first_lookup_time.pop(lookup_id, None)
+            self.aborted_lookups.discard(lookup_id)
+
     def _cleanup_finished_aborted_lookups(self) -> None:
         """Check for finished aborted lookups and send cleanup messages to workers."""
         # A lookup whose status is None is still loading.
