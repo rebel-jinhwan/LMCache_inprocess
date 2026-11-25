@@ -25,10 +25,11 @@ from lmcache.logging import init_logger
 
 if TYPE_CHECKING:
     # Third Party
-    from vllm.config import VllmConfig
+    from vllm.config import ParallelConfig, VllmConfig
 
 __all__ = [
     "ENGINE_NAME",
+    "align_mla_rank_dedup_with_pp",
     "apply_mm_hashes_to_token_ids",
     "calculate_draft_layers",
     "calculate_local_rank_and_world_size",
@@ -225,6 +226,48 @@ def create_lmcache_metadata(
         kv_connector_extra_config=kv_connector_extra_config,
     )
     return metadata, config
+
+
+def align_mla_rank_dedup_with_pp(
+    config: LMCacheEngineConfig,
+    parallel_config: "ParallelConfig",
+    use_mla: bool,
+) -> None:
+    """Turn off MLA's cross-rank cache dedup when pipeline parallel is on.
+
+    ``save_only_first_rank``, ``remote_enable_mla_worker_id_as0`` and the
+    lookup server ranks default from ``use_mla`` alone, on the premise that
+    every rank holds byte-identical MLA KV: true across TP, false across PP,
+    where each stage caches only its own layers.
+
+    Left on, ``save_only_first_rank`` makes every rank but global rank 0
+    passive: it stores nothing and waits for rank 0 to broadcast the chunks
+    over the TP group. Under ``pp > 1, tp = 1`` that group has one member, so
+    a passive rank retrieves 0 tokens while the scheduler's lookup, answered
+    by rank 0 alone, reported a prefix hit, and vLLM fails the request. With
+    TP as well, rank 0 broadcasts its own stage's layers to the other stages'
+    ranks.
+    """
+    pp_size = parallel_config.pipeline_parallel_size
+    if not use_mla or pp_size <= 1:
+        return
+
+    if config.extra_config is None:
+        config.extra_config = {}
+    config.extra_config["save_only_first_rank"] = False
+    config.extra_config["remote_enable_mla_worker_id_as0"] = False
+    # Stages store as each stage's forward retires, not in lockstep like TP
+    # ranks, so a hit must be confirmed by every rank, not just rank 0.
+    config.lookup_server_worker_ids = list(range(parallel_config.world_size))
+
+    logger.warning(
+        "MLA + pipeline_parallel_size=%d: each PP stage caches its own "
+        "layers, so LMCache's MLA rank dedup is disabled "
+        "(save_only_first_rank / remote_enable_mla_worker_id_as0 off, "
+        "lookup on all %d ranks).",
+        pp_size,
+        parallel_config.world_size,
+    )
 
 
 def validate_mla_config(config: LMCacheEngineConfig, use_mla: bool) -> None:
