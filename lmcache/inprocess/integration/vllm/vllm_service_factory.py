@@ -74,6 +74,7 @@ class VllmServiceFactory(BaseServiceFactory):
 
         # First Party
         from lmcache.inprocess.integration.vllm.utils import (
+            align_mla_rank_dedup_with_pp,
             calculate_draft_layers,
             calculate_local_rank_and_world_size,
             mla_enabled,
@@ -97,6 +98,7 @@ class VllmServiceFactory(BaseServiceFactory):
 
         use_mla = mla_enabled(model_config)
         validate_mla_config(self.lmcache_config, use_mla)
+        align_mla_rank_dedup_with_pp(self.lmcache_config, parallel_config, use_mla)
 
         num_layer = model_config.get_num_layers(parallel_config)
         num_draft_layers = calculate_draft_layers(self.vllm_config)

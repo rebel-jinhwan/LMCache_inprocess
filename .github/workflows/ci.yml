@@ -89,6 +89,7 @@ jobs:
             "${GITHUB_WORKSPACE}/tests/inprocess/v1/test_rbln_connector.py" \
             "${GITHUB_WORKSPACE}/tests/inprocess/v1/test_offload_server.py" \
             "${GITHUB_WORKSPACE}/tests/inprocess/v1/test_store_kv_events.py" \
+            "${GITHUB_WORKSPACE}/tests/inprocess/v1/test_mla_rank_dedup_pp.py" \
             "${GITHUB_WORKSPACE}/tests/inprocess/standalone/test_parse_kvcache_shape_spec.py" \
             "${GITHUB_WORKSPACE}/tests/inprocess/test_observability.py" \
             "${GITHUB_WORKSPACE}/tests/inprocess/usage_telemetry/test_usage_telemetry.py"
