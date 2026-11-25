@@ -16,6 +16,7 @@ _path_filter_pipeline_kind() {
         *k3_tests/integration/pipeline.yml) echo integration ;;
         *k3_tests/correctness/pipeline.yml) echo correctness ;;
         *k3_tests/comprehensive/pipeline.yml) echo comprehensive ;;
+        *k3_tests/rbln/pipeline.yml) echo rbln ;;
         *) echo generic ;;
     esac
 }
@@ -36,6 +37,9 @@ _path_filter_is_relevant() {
             return 0
             ;;
         correctness:.buildkite/k3_tests/correctness/*)
+            return 0
+            ;;
+        rbln:.buildkite/k3_tests/rbln/*|rbln:tests/inprocess/v1/test_rbln_connector.py)
             return 0
             ;;
         comprehensive:.buildkite/configs/*|comprehensive:.buildkite/k3_tests/comprehensive/*|comprehensive:benchmarks/*|comprehensive:examples/inprocess/disagg_prefill/*)

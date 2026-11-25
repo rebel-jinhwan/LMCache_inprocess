@@ -38,7 +38,8 @@ fi
 for bootstrap in \
   .buildkite/k3_tests/integration/buildkite-pipeline.yml \
   .buildkite/k3_tests/correctness/buildkite-pipeline.yml \
-  .buildkite/k3_tests/comprehensive/buildkite-pipeline.yml; do
+  .buildkite/k3_tests/comprehensive/buildkite-pipeline.yml \
+  .buildkite/k3_tests/rbln/buildkite-pipeline.yml; do
   test -s "${bootstrap}"
 done
 

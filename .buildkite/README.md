@@ -12,6 +12,7 @@ in `UPSTREAM_REVISION`.
 | Integration | `k3_tests/integration/buildkite-pipeline.yml` | Two-request CPU and disk backend smoke tests | 1 |
 | Correctness | `k3_tests/correctness/buildkite-pipeline.yml` | Baseline-vs-InProcess output comparison | 1 |
 | Comprehensive | `k3_tests/comprehensive/buildkite-pipeline.yml` | Configuration matrix, performance checks, PD, and P2P | 1 or 2 |
+| RBLN | `k3_tests/rbln/buildkite-pipeline.yml` | `RBLNConnector` round trips on a Rebellions NPU | 1 NPU |
 
 For each Buildkite pipeline, copy the corresponding bootstrap file into the
 Buildkite **Steps** editor. The bootstrap performs path filtering and uploads
@@ -25,6 +26,9 @@ The jobs expect the existing LMCache K3 environment:
 - `/data/huggingface` for the Hugging Face cache;
 - `/data/datasets` for correctness data;
 - `HF_TOKEN` for gated models when needed.
+
+The RBLN pipeline instead runs on LMCache's `rbln-queue` with an `rbln-serve`
+image and one NPU claimed through DRA; see `k3_tests/rbln/BK_WEB_SETUP.md`.
 
 ## Dependency boundary
 
