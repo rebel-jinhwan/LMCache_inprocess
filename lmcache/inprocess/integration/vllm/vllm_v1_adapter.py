@@ -434,6 +434,10 @@ class ReqMeta:
 @dataclass
 class LMCacheConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta] = field(default_factory=list)
+    # Requests that finished after a synchronous lookup pinned their hit
+    # chunks on the workers but before vLLM allocated their blocks. No load
+    # or save will ever name them, so the workers unpin them from this list.
+    unpin_lookup_ids: set[str] = field(default_factory=set)
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -574,6 +578,11 @@ class LMCacheConnectorV1Impl:
 
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
+        # Scheduler: synchronous lookups whose request has no blocks yet, and
+        # those of them whose request finished before getting any. See
+        # LMCacheConnectorMetadata.unpin_lookup_ids.
+        self._unallocated_sync_lookup_ids: set[str] = set()
+        self._abandoned_lookup_ids: set[str] = set()
 
         # Chunked KV loading: cap the number of external tokens
         # reported per scheduling step to prevent GPU block pool
@@ -777,6 +786,13 @@ class LMCacheConnectorV1Impl:
 
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
+
+        # vLLM calls start_load_kv on every step, including a step that runs no
+        # forward, so abandoned lookups are released on the step after their
+        # request finished.
+        if self.lmcache_engine is not None:
+            for lookup_id in metadata.unpin_lookup_ids:
+                self.lmcache_engine.lookup_unpin(lookup_id)
 
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
@@ -1435,6 +1451,11 @@ class LMCacheConnectorV1Impl:
                 lookup_id=req_id,
                 request_configs=request_configs,
             )
+            if not self.async_loading:
+                # The lookup pinned the hit chunks on every worker. Only a
+                # load or save of this request unpins them, so track it until
+                # vLLM allocates its blocks (update_state_after_alloc).
+                self._unallocated_sync_lookup_ids.add(req_id)
 
         if num_external_hit_tokens is None:
             logger.debug(
@@ -1552,6 +1573,7 @@ class LMCacheConnectorV1Impl:
         # Clear local status in lookup client when a new request is
         # successfully scheduled.
         self.lookup_client.clear_lookup_status(request.request_id)
+        self._unallocated_sync_lookup_ids.discard(request.request_id)
 
         kv_transfer_params = (
             request.kv_transfer_params
@@ -1634,7 +1656,8 @@ class LMCacheConnectorV1Impl:
 
         force_skip_save = self.kv_role == "kv_consumer" or self.force_skip_save
 
-        meta = LMCacheConnectorMetadata()
+        meta = LMCacheConnectorMetadata(unpin_lookup_ids=self._abandoned_lookup_ids)
+        self._abandoned_lookup_ids = set()
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
@@ -1868,6 +1891,15 @@ class LMCacheConnectorV1Impl:
             self, "_layerwise_save_storers"
         ):
             self._layerwise_save_storers.pop(request.request_id, None)
+
+        # A synchronous lookup pinned this request's hit chunks on the workers,
+        # but it finished (an abort, typically) before vLLM allocated its
+        # blocks, so no load or save will unpin them. Have the workers unpin
+        # them on the next step. Async lookups are cancelled below instead.
+        unallocated = getattr(self, "_unallocated_sync_lookup_ids", set())
+        if request.request_id in unallocated:
+            unallocated.remove(request.request_id)
+            self._abandoned_lookup_ids.add(request.request_id)
 
         # Cleanup if request was aborted. The per-branch logic below already
         # degrades gracefully when ``lmcache_engine`` and/or ``lookup_client``
