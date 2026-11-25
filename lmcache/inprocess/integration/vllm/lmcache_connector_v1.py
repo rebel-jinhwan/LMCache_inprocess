@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 # Third Party
 from vllm.config import VllmConfig
@@ -22,9 +22,14 @@ from lmcache.inprocess.integration.vllm.vllm_v1_adapter import (
 if TYPE_CHECKING:
     # Third Party
     from vllm.attention.backends.abstract import AttentionMetadata
+    from vllm.distributed.kv_events import KVCacheEvent
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
+
+    # First Party
+    from lmcache.inprocess.integration.vllm.kv_events import ConsensusKVEvents
 
 logger = init_logger(__name__)
 
@@ -45,6 +50,8 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         else:
             super().__init__(vllm_config=vllm_config, role=role)
         self._lmcache_engine = LMCacheConnectorV1Impl(vllm_config, role, self)
+        # Scheduler: KV cache events agreed by the workers, until take_events.
+        self._kv_cache_events: Optional[list["KVCacheEvent"]] = None
 
     # ==============================
     # Worker-side methods
@@ -137,6 +144,49 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         """Return block IDs that failed to load during the last interval."""
         return self._lmcache_engine.get_block_ids_with_load_errors()
 
+    def get_kv_connector_kv_cache_events(self) -> Optional["ConsensusKVEvents"]:
+        """Report the chunks this worker stored since the last step.
+
+        Every storing worker reports a batch, an empty one included: vLLM
+        counts each reporting worker as one vote, and a store is advertised
+        only once all of them report it (see :class:`ConsensusKVEvents`). A
+        worker that stores nothing by design, a passive rank under
+        ``save_only_first_rank``, does not vote.
+        """
+        engine = self._lmcache_engine.lmcache_engine
+        if engine is None:
+            return None
+        # Drain on every step, voting or not, so the queue does not grow.
+        stored = engine.get_kv_events()
+        if not engine.kv_events_enabled or (
+            engine.save_only_first_rank and not engine.metadata.is_first_rank()
+        ):
+            return None
+
+        # Third Party
+        from vllm.distributed.kv_events import BlockStored
+
+        # First Party
+        from lmcache.inprocess.integration.vllm.kv_events import ConsensusKVEvents
+
+        events = [
+            BlockStored(
+                block_hashes=e.block_hashes,
+                parent_block_hash=e.parent_block_hash,
+                token_ids=e.token_ids,
+                block_size=e.block_size,
+                lora_id=e.lora_id,
+                medium=e.medium,
+                lora_name=getattr(e, "lora_name", None),
+            )
+            for e in stored
+        ]
+        kv_events = ConsensusKVEvents(num_workers=1)
+        # Several requests of one step can store the same prefix; a worker's
+        # vote must count once.
+        kv_events.add_events(list(dict.fromkeys(events)))
+        return kv_events
+
     def shutdown(self):
         """
         Shutdown the connector. This is called when the worker process
@@ -191,6 +241,28 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
         return self._lmcache_engine.build_connector_meta(scheduler_output)
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
+        """Keep the KV cache events the workers agreed on in this step."""
+        # First Party
+        from lmcache.inprocess.integration.vllm.kv_events import ConsensusKVEvents
+
+        kv_cache_events = connector_output.kv_cache_events
+        if not isinstance(kv_cache_events, ConsensusKVEvents):
+            return
+        if self._kv_cache_events is None:
+            self._kv_cache_events = []
+        # Votes belong to one step. Steps accumulated before take_events are
+        # appended, not counted as more workers.
+        self._kv_cache_events.extend(kv_cache_events.aggregate().get_all_events())
+
+    def take_events(self) -> Iterable["KVCacheEvent"]:
+        """Hand the agreed KV cache events to vLLM's KV event publisher."""
+        if self._kv_cache_events is None:
+            return ()
+        events = self._kv_cache_events
+        self._kv_cache_events = None
+        return events
 
     def request_finished(
         self,
