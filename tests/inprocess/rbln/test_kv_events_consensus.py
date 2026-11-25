@@ -133,10 +133,6 @@ def test_worker_reports_empty_votes_except_passive_mla(passive: bool) -> None:
     engine = MagicMock(kv_events_enabled=True, save_only_first_rank=passive)
     engine.metadata.is_first_rank.return_value = False
     engine.get_kv_events.return_value = []
-    backend = MagicMock()
-    type(backend).__name__ = "RDSBackend"
-    backend.take_evicted_hashes.return_value = []
-    engine.storage_manager.storage_backends = {"RDSBackend": backend}
     worker = RBLNLMCacheConnectorV1.__new__(RBLNLMCacheConnectorV1)
     worker._lmcache_engine = MagicMock(lmcache_engine=engine)
     batch = worker.get_kv_connector_kv_cache_events()
@@ -145,39 +141,12 @@ def test_worker_reports_empty_votes_except_passive_mla(passive: bool) -> None:
         assert batch.get_all_events() == []
         assert batch.get_number_of_workers() == 1
     engine.get_kv_events.assert_called_once()
-    backend.take_evicted_hashes.assert_called_once()
 
 
 def test_passive_mla_rank_is_not_a_missing_store_vote() -> None:
     scheduler = _scheduler()
     scheduler.update_connector_output(_executor([_batch([_stored()]), None]))
     assert list(scheduler.take_events()) == [_stored()]
-
-
-def test_worker_failure_on_nonfirst_stage_reaches_scheduler() -> None:
-    engine = MagicMock(kv_events_enabled=True, save_only_first_rank=False)
-    event = CacheStoreEvent(
-        block_hashes=[7],
-        parent_block_hash=None,
-        token_ids=[1, 2],
-        block_size=2,
-        lora_id=None,
-        medium="rds",
-        lora_name=None,
-    )
-    engine.get_kv_events.return_value = [event]
-    backend = MagicMock()
-    type(backend).__name__ = "RDSBackend"
-    backend.take_evicted_hashes.return_value = [7]
-    engine.storage_manager.storage_backends = {"RDSBackend": backend}
-    worker = RBLNLMCacheConnectorV1.__new__(RBLNLMCacheConnectorV1)
-    worker._lmcache_engine = MagicMock(lmcache_engine=engine)
-    batch = worker.get_kv_connector_kv_cache_events()
-    scheduler = _scheduler()
-    scheduler.update_connector_output(_executor([_batch([_stored()]), batch]))
-    assert list(scheduler.take_events()) == [
-        BlockRemoved(block_hashes=[7], medium="rds")
-    ]
 
 
 def test_disabled_events_do_not_create_empty_transport_batches() -> None:
@@ -198,9 +167,7 @@ def test_event_batch_clear_and_repeated_aggregation() -> None:
     assert events.get_number_of_workers() == 1
 
 
-@pytest.mark.parametrize(
-    "case", ["success", "failed", "evicted", "duplicate", "passive"]
-)
+@pytest.mark.parametrize("case", ["success", "failed", "duplicate", "passive"])
 @pytest.mark.parametrize("pp_size", [1, 2, 4])
 def test_speculative_save_reaches_consensus_without_another_step(
     monkeypatch: pytest.MonkeyPatch, case: str, pp_size: int
@@ -231,10 +198,6 @@ def test_speculative_save_reaches_consensus_without_another_step(
     engine = MagicMock(kv_events_enabled=True, save_only_first_rank=case == "passive")
     engine.metadata.is_first_rank.return_value = False
     engine.get_kv_events.side_effect = drain_stores
-    backend = MagicMock()
-    type(backend).__name__ = "RDSBackend"
-    backend.take_evicted_hashes.side_effect = [[7] if case == "evicted" else [], []]
-    engine.storage_manager.storage_backends = {"RDSBackend": backend}
     worker = RBLNLMCacheConnectorV1.__new__(RBLNLMCacheConnectorV1)
     worker._lmcache_engine = MagicMock(lmcache_engine=engine)
 
@@ -297,8 +260,6 @@ def test_speculative_save_reaches_consensus_without_another_step(
     expected = [] if case in ("failed", "passive") else [_stored()]
     if case == "passive" and pp_size > 1:
         expected = [_stored()]
-    if case == "evicted":
-        expected = [BlockRemoved(block_hashes=[7], medium="rds")]
     assert list(scheduler.take_events()) == expected
     assert list(scheduler.take_events()) == []
     assert order == ["draft", "save"]

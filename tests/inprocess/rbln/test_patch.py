@@ -118,16 +118,13 @@ class TestRBLNConnectorV1:
 
     @pytest.mark.parametrize("copies", [1, 2, 3])
     def test_kv_events_round_trip_worker_to_scheduler(self, copies):
-        """Worker side turns the engine's CacheStoreEvents + RDS evictions into
-        BlockStored/BlockRemoved; scheduler side hands them to take_events."""
+        """Worker side turns the engine's CacheStoreEvents into BlockStored;
+        scheduler side hands them to take_events."""
         # Third Party
-        from vllm.distributed.kv_events import BlockRemoved, BlockStored
+        from vllm.distributed.kv_events import BlockStored
         from vllm.v1.outputs import KVConnectorOutput
 
         # First Party
-        from lmcache.inprocess.rbln._rds_plugin import (
-            RDS_KV_EVENT_MEDIUM as KV_EVENT_MEDIUM,
-        )
         from lmcache.inprocess.rbln.integration.vllm.connector import (
             RBLNLMCacheConnectorV1,
         )
@@ -139,24 +136,19 @@ class TestRBLNConnectorV1:
             token_ids=[1, 2],
             block_size=2,
             lora_id=None,
-            medium=KV_EVENT_MEDIUM,
+            medium="cpu",
             lora_name=None,
         )
-        rds = MagicMock()
-        type(rds).__name__ = "RDSBackend"
-        rds.take_evicted_hashes.return_value = [5]
         engine = MagicMock()
         engine.kv_events_enabled = True
         engine.save_only_first_rank = False
         # Multiple requests can save an identical prefix in one worker step.
         engine.get_kv_events.return_value = [stored] * copies
-        engine.storage_manager.storage_backends = {"RDSBackend": rds}
 
         worker = RBLNLMCacheConnectorV1.__new__(RBLNLMCacheConnectorV1)
         worker._lmcache_engine = MagicMock(lmcache_engine=engine)
         kv_events = worker.get_kv_connector_kv_cache_events()
         engine.get_kv_events.assert_called_once()
-        rds.take_evicted_hashes.assert_called_once()
         assert kv_events is not None
 
         scheduler = RBLNLMCacheConnectorV1.__new__(RBLNLMCacheConnectorV1)
@@ -170,10 +162,9 @@ class TestRBLNConnectorV1:
                 token_ids=[1, 2],
                 block_size=2,
                 lora_id=None,
-                medium=KV_EVENT_MEDIUM,
+                medium="cpu",
                 lora_name=None,
             ),
-            BlockRemoved(block_hashes=[5], medium=KV_EVENT_MEDIUM),
         ]
         # Drained: nothing left for the next step.
         assert list(scheduler.take_events()) == []

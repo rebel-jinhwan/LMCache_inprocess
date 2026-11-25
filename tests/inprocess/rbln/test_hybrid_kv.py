@@ -114,7 +114,6 @@ def test_failed_load_blocks_saves_until_scheduler_reset(role, monkeypatch):
     )
     impl = object.__new__(RBLNLMCacheConnectorV1Impl)
     impl._use_grouped_slots = True
-    impl._rds_fail_fast_enabled = False
     impl._failed_load_req_ids = set()
     impl._block_size = impl._lmcache_chunk_size = 8
     spec = FullAttentionSpec(

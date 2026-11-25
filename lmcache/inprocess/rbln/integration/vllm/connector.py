@@ -21,7 +21,7 @@ import time
 # Third Party
 from typing_extensions import override
 from vllm.config import VllmConfig
-from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
+from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorHandshakeMetadata,
@@ -50,13 +50,6 @@ from lmcache.inprocess.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorMetadata,
     LMCacheConnectorV1Impl,
     LoadSpec,
-)
-from lmcache.inprocess.rbln._rds_plugin import (
-    RDS_KV_EVENT_MEDIUM,
-    fail_fast_enabled,
-    get_rds_backend,
-    raise_if_engine_failed,
-    validate_rds_backend,
 )
 from lmcache.inprocess.rbln.integration.vllm.cache_layout import (
     BlockAuxSpec,
@@ -267,7 +260,6 @@ class RBLNLMCacheConnectorV1Impl(LMCacheConnectorV1Impl):
                 "Unset LMCACHE_USE_LAYERWISE or set it to False."
             )
         self.config = config
-        self._rds_fail_fast_enabled = False
         self._request_blocks: dict[str, KVCacheBlocks] = {}
         self._failed_load_req_ids: set[str] = set()
         # Requests whose reclaimed window sits past LMCache's contiguous
@@ -414,10 +406,6 @@ class RBLNLMCacheConnectorV1Impl(LMCacheConnectorV1Impl):
             wrapped = _ResetSafeLookupClient(client, actual)
             self._reset_safe_lookup_client = wrapped
         return wrapped
-
-    def _raise_if_rds_failed(self) -> None:
-        if self._rds_fail_fast_enabled:
-            raise_if_engine_failed(self.lmcache_engine)
 
     @override
     def get_num_new_matched_tokens(
@@ -636,16 +624,12 @@ class RBLNLMCacheConnectorV1Impl(LMCacheConnectorV1Impl):
         return failed
 
     def start_load_kv(self, forward_context, **kwargs) -> None:
-        self._raise_if_rds_failed()
         if self._use_grouped_slots:
             metadata = self._parent._get_connector_metadata()
             self._failed_load_req_ids.difference_update(metadata.reset_req_ids)
         super().start_load_kv(forward_context, **kwargs)
-        # Upstream may turn a backend exception into a failed cache lookup.
-        self._raise_if_rds_failed()
 
     def wait_for_save(self) -> None:
-        self._raise_if_rds_failed()
         if self._use_grouped_slots and self._failed_load_req_ids:
             # Queued forwards may share the failed prefix. Resume publication
             # only after the scheduler invalidates it and resets the requests.
@@ -654,7 +638,6 @@ class RBLNLMCacheConnectorV1Impl(LMCacheConnectorV1Impl):
                 self.lmcache_engine.lookup_unpin(request.req_id)
             return
         super().wait_for_save()
-        self._raise_if_rds_failed()
 
     @staticmethod
     def _normalize_kv_shape(
@@ -705,13 +688,6 @@ class RBLNLMCacheConnectorV1Impl(LMCacheConnectorV1Impl):
             )
         normalized_kv_caches = self._normalize_kv_shape(kv_caches)
         super().register_kv_caches(normalized_kv_caches)
-        # Storage plugins are created by post_init during registration, not
-        # when the service factory first constructs the engine. Resolve the
-        # worker's policy here so load/save checks only inspect failure state.
-        self._rds_fail_fast_enabled = fail_fast_enabled(self.config)
-        if self._rds_fail_fast_enabled:
-            validate_rds_backend(self.config, self.lmcache_engine)
-        self._raise_if_rds_failed()
 
         assert self.lmcache_engine is not None
         connector: RBLNConnector = self.lmcache_engine.gpu_connector
@@ -1098,9 +1074,7 @@ class RBLNLMCacheConnectorV1(LMCacheConnectorV1Dynamic, SupportsHMA):
     # engine's ``CacheStoreEvent`` queue (filled by ``store`` when
     # ``LMCACHE_ENABLE_KV_EVENTS`` is on) into ``BlockStored`` and rides it to
     # the scheduler on ``KVConnectorOutput.kv_cache_events``; the scheduler
-    # hands it to ``kv_event_publisher`` via ``take_events``. On top of that,
-    # RDS evictions become ``BlockRemoved`` so a cache-aware router (llm-d
-    # EPP) stops routing prefixes to a pod that already dropped them.
+    # hands it to ``kv_event_publisher`` via ``take_events``.
     #
     # Every storing rank reports, including an empty batch when nothing was
     # stored. RBLNKVEvents requires all ranks to advertise a store, but a
@@ -1116,8 +1090,6 @@ class RBLNLMCacheConnectorV1(LMCacheConnectorV1Dynamic, SupportsHMA):
         if engine is None:
             return None
         stored = engine.get_kv_events()
-        backend = get_rds_backend(engine)
-        evicted = backend.take_evicted_hashes() if backend is not None else []
         if not engine.kv_events_enabled or (
             engine.save_only_first_rank and not engine.metadata.is_first_rank()
         ):
@@ -1134,10 +1106,6 @@ class RBLNLMCacheConnectorV1(LMCacheConnectorV1Dynamic, SupportsHMA):
             )
             for e in stored
         ]
-        if evicted:
-            events.append(
-                BlockRemoved(block_hashes=evicted, medium=RDS_KV_EVENT_MEDIUM)
-            )
         # Empty batches are votes too: otherwise a successful stage could
         # advertise KV while another stage failed or skipped its store.
         kv_events = RBLNKVEvents(num_workers=1)
