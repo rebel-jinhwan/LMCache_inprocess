@@ -12,6 +12,10 @@ Integration with vLLM-RBLN:
     skip) ship in ``lmcache-rbln`` and take effect on ``import lmcache_rbln``,
     which must happen before the engine allocates its CPU pool.
 
+    The RDS (NVMe) storage tier is a separate LMCache storage plugin shipped
+    by ``lmcache-rbln``; see :mod:`lmcache.inprocess.rbln._rds_plugin` for the
+    interface the connector expects from it.
+
 Note:
     This subpackage needs ``torch-rbln`` (and ``vllm-rbln`` for the vLLM
     integration) at runtime. They are not dependencies of
