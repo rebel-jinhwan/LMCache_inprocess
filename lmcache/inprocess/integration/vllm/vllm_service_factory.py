@@ -289,16 +289,13 @@ class VllmServiceFactory(BaseServiceFactory):
         if self.role != "worker":
             return None
 
-        # Third Party
-        from vllm.distributed.parallel_state import (
-            get_tensor_model_parallel_rank,
-        )
-
         self._ensure_engine()
         assert self.lmcache_engine is not None
+        # Key the socket by global rank: workers of one engine share its IPC
+        # path prefix, and pipeline stages on one host can share a TP rank.
         return ZMQOffloadServer(
             self.lmcache_engine,
-            get_tensor_model_parallel_rank(),
+            self.lmcache_engine.metadata.worker_id,
         )
 
     def maybe_create_runtime_plugin_launcher(
