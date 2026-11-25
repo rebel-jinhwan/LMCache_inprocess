@@ -22,6 +22,9 @@ from lmcache.inprocess.integration.vllm.vllm_v1_adapter import (
 if TYPE_CHECKING:
     # Third Party
     from vllm.attention.backends.abstract import AttentionMetadata
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorHandshakeMetadata,
+    )
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
@@ -208,3 +211,16 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             returned by the engine.
         """
         return self._lmcache_engine.request_finished(request, block_ids)
+
+    def set_xfer_handshake_metadata_pp_aware(
+        self, metadata: dict[tuple[int, int], "KVConnectorHandshakeMetadata"]
+    ) -> None:
+        """Accept handshake metadata from every pipeline stage, and ignore it.
+
+        LMCache offloads KV within this instance and never takes part in a
+        cross-instance transfer handshake, so it has nothing to read here.
+        vLLM's default raises on any ``pp_rank > 0`` key, and when LMCache sits
+        in a ``MultiConnector`` beside a transfer connector that does serve
+        pipeline parallelism (NIXL), that raise fails the whole stack.
+        """
+        return None
