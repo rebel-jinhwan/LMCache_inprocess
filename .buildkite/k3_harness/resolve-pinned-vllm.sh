@@ -33,7 +33,6 @@
 #   PINNED_VLLM_FULL_SHA        -- 40-char commit SHA, if recorded in pin
 #   PINNED_VLLM_ARCHIVE_INDEX_URL
 #                               -- permanent PEP 503 simple index, if recorded
-#   PINNED_XPU_IMAGE            -- XPU runtime image (never empty)
 #   PINNED_RBLN_IMAGE           -- RBLN rbln-serve image (never empty)
 #
 # The script never fails the build: a missing/unreachable pin file just
